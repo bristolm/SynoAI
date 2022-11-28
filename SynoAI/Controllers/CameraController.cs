@@ -8,7 +8,6 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
-using SynoAI.Extensions;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -154,6 +153,8 @@ namespace SynoAI.Controllers
                     int maxSizeX = camera.GetMaxSizeX();
                     int maxSizeY = camera.GetMaxSizeY();
 
+                    List<Zone> created = new();
+                    List<Zone> unmatched = new(camera.Exclusions ?? new());
                     List<AIPrediction> validPredictions = new();
                     foreach (AIPrediction prediction in predictions)
                     {
@@ -177,11 +178,35 @@ namespace SynoAI.Controllers
                             }
                             else
                             {
-                                bool include = ShouldIncludePrediction(id, camera, overallStopwatch, prediction);
+                                bool include = ShouldIncludePrediction(id, camera, overallStopwatch, prediction, unmatched);
                                 if (include)
                                 {
                                     validPredictions.Add(prediction);
                                     _logger.LogDebug($"{id}: Found valid prediction '{prediction.Label}' ([{prediction.MinX},{prediction.MinY}],[{prediction.MaxX},{prediction.MaxY}]) at EVENT TIME {overallStopwatch.ElapsedMilliseconds}ms.");
+
+                                    // add a temporary Intersect exclusion zone that's a little larger than the prediction
+                                    if (camera.ExcludeIdlePredictions)
+                                    {
+                                        int xoff = Math.Max((prediction.MaxX - prediction.MinX) / 10, 5);
+                                        int yoff = Math.Max((prediction.MaxY - prediction.MinY) / 10, 5);
+
+                                        Models.Point min = new();
+                                        min.X = prediction.MinX - xoff;
+                                        min.Y = prediction.MinY - yoff;
+
+                                        Models.Point max = new();
+                                        max.X = prediction.MaxX + xoff;
+                                        max.Y = prediction.MaxY + yoff;
+
+                                        Zone zone = new();
+                                        zone.Start = min;
+                                        zone.End = max;
+                                        zone.Prediction = prediction;
+                                        zone.Mode = OverlapMode.Contains;
+
+                                        _logger.LogDebug($"{id}: Adding temporary exclusion for '{prediction.Label}' ([{zone.Start.X},{zone.Start.Y}],[{zone.End.X},{zone.End.Y}]) at EVENT TIME {overallStopwatch.ElapsedMilliseconds}ms.");
+                                        created.Add(zone);
+                                    }
                                 }
                             }
                         }
@@ -194,6 +219,26 @@ namespace SynoAI.Controllers
                     {
                         _logger.LogInformation($"{id}: Saving original image");
                         SnapshotManager.SaveOriginalImage(_logger, camera, snapshot);
+                    }
+
+                    // add in new ones now so they don't trip on predictions from this measurement
+                    if (camera.Exclusions == null)
+                        camera.Exclusions = new();
+                    camera.Exclusions.AddRange(created);
+
+                    // clean out unmatched temp exclusions
+                    foreach (Zone exclusion in unmatched)
+                    {
+                        // Clear any unmatched exclusion that was created from a prediction
+                        if (exclusion.Prediction != null)
+                        {
+                            _logger.LogDebug($"{id}: Removing temporary exclusion zone ([{exclusion.Start.X},{exclusion.Start.Y}],[{exclusion.End.X},{exclusion.End.Y}]) as it did not match with any prediction");
+                            camera.Exclusions.Remove(exclusion);
+
+                            // Send a notification if this was idle for more than 1 detection
+                            if (exclusion.Detections > 0)
+                                validPredictions.Add(exclusion.Prediction);
+                        }
                     }
 
                     if (validPredictions.Count > 0)
@@ -242,6 +287,7 @@ namespace SynoAI.Controllers
                     _logger.LogInformation($"{id}: Finished ({overallStopwatch.ElapsedMilliseconds}ms).");
                 }
 
+
                 // Add the delay (if any)
                 int delay = camera.GetDelay();
                 AddCameraDelay(id, delay);
@@ -274,9 +320,11 @@ namespace SynoAI.Controllers
         /// <param name="camera">The camera object.</param>
         /// <param name="overallStopwatch">The current stopwatch for logging.</param>
         /// <param name="prediction">The prediction to validate.</param>
+        /// <param name="unmatched">Dynamic list of unmatched exclusion zones - each is removed when matched.</param>
         /// <returns>True if the prediction is valid.</returns>
-        private bool ShouldIncludePrediction(string id, Camera camera, Stopwatch overallStopwatch, AIPrediction prediction)
+        private bool ShouldIncludePrediction(string id, Camera camera, Stopwatch overallStopwatch, AIPrediction prediction, List<Zone> unmatched)
         {
+            bool ret = true;
             // Check if the prediction falls within the exclusion zones
             if (camera.Exclusions != null && camera.Exclusions.Count() > 0)
             {
@@ -289,16 +337,33 @@ namespace SynoAI.Controllers
                     int endY = Math.Max(exclusion.Start.Y, exclusion.End.Y);
                     Rectangle exclusionZoneBoundary = new(startX, startY, endX - startX, endY - startY);
                     bool exclude = exclusion.Mode == OverlapMode.Contains ? exclusionZoneBoundary.Contains(boundary) : exclusionZoneBoundary.IntersectsWith(boundary);
+                    if (exclude && exclusion.Prediction != null)
+                    {
+                        // if this is an exclusion of a prediction be more careful about matches
+                        int innerStartX = exclusion.Prediction.MinX + (exclusion.Prediction.MinX - exclusion.Start.X);
+                        int innerStartY = exclusion.Prediction.MinY + (exclusion.Prediction.MinY - exclusion.Start.Y);
+                        int innerEndX = exclusion.Prediction.MaxX - (exclusion.Prediction.MaxX - exclusion.End.X);
+                        int innerEndY = exclusion.Prediction.MaxY - (exclusion.Prediction.MaxY - exclusion.End.Y);
+                        if (innerEndX > innerStartX && innerEndY > innerStartY)
+                        {
+                            Rectangle inclusionZoneBoundary = new(innerStartX, innerStartY, innerEndX - innerStartX, innerEndX - innerEndY);
+                            exclude = !boundary.Contains(inclusionZoneBoundary);
+                        }
+                    }
                     if (exclude)
                     {
-                        // The prediction boundary is contained within or intersects and exclusion zone, so ignore it    ;
+                        exclusion.Detections++;
+
+                        // The prediction boundary is contained within or intersects an exclusion zone, so ignore it
                         _logger.LogDebug($"{id}: Ignored matching '{prediction.Label}' ([{prediction.MinX},{prediction.MinY}],[{prediction.MaxX},{prediction.MaxY}]) as it fell within the exclusion zone ([{exclusion.Start.X},{exclusion.Start.Y}],[{exclusion.End.X},{exclusion.End.Y}]) with exclusion mode '{exclusion.Mode}' at EVENT TIME {overallStopwatch.ElapsedMilliseconds}ms.");
-                        return false;
+                        ret = false;
+
+                        // Take it out of the unmatched list
+                        unmatched.Remove(exclusion);
                     }
                 }
             }
-
-            return true;
+            return ret;
         }
 
         /// <summary>

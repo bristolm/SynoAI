@@ -56,11 +56,15 @@ namespace SynoAI.Models
         /// Upon movement, the maximum number of snapshots sequentially retrieved from SSS until finding an object of interest (i.e. 4 snapshots). If not specified, this will 
         /// use the value specified on the main config.
         /// </summary>
-        public int? MaxSnapshots { get; set; } 
+        public int? MaxSnapshots { get; set; }
         /// <summary>
         /// The zones to exclude when checking for objects of interest.
         /// </summary>
-        public List<Zone> Exclusions { get; set; } 
+        public List<Zone> Exclusions { get; set; }
+        /// <summary>
+        /// Skip repeat detections until they no longer are detected.
+        /// </summary>
+        public bool ExcludeIdlePredictions { get; set; }
 
         /// <summary>
         /// Gets the minimum size the object must be horizontally to be considered as a valid result from either the current camera, or the main config default if not specified.

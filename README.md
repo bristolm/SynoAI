@@ -122,6 +122,7 @@ An example appsettings.json configuration file can be found [here](#example-apps
 * DelayAfterSuccess [optional] (Default: ```0```): Will override the value set on the top level ```DelayAfterSuccess```
 * MaxSnapshots [optional] (Default: ```NULL```): Upon movement, the maximum number of snapshots sequentially retrieved from SSS until finding an object of interest (i.e. 4 snapshots). If not specified, will use the value from the main config.
 * Rotate [optional] (Default: ```0```): The degrees to rotate the image after it's captured from SurveillanceStation. The rotation will be applied before it's passed to the AI
+* ExcludeIdlePredictions [optional] (Default: ```false```): Flag predictions as temporary ```Intersect``` exclusions for subsequent detection events. This prevents idle items from re-triggering repeat notifications. When the exclusion finds nothing to exclude it is cleared and a notification will be sent if the prediction was excluded over multiple events. An outline will be drawn where the item was if ```DrawExclusions```is set
 * Exclusions [optional]: An array of exclusion zones to ignore found objects within. If the entirity of an object is within the exclusion zone, then it won't be reported by the notifiers.
   * Start [required]
     * X: The start X co-ordinate of the exclusion zone
