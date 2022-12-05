@@ -35,6 +35,8 @@ namespace SynoAI.Controllers
 
         private static ConcurrentDictionary<string, bool> _runningCameraChecks = new(StringComparer.OrdinalIgnoreCase);
         private static ConcurrentDictionary<string, DateTime> _delayedCameraChecks = new(StringComparer.OrdinalIgnoreCase);
+        private static ConcurrentDictionary<string, DateTime> _recentCameraChecks = new(StringComparer.OrdinalIgnoreCase);
+        private static ConcurrentDictionary<string, Task> _pendingGetRequests = new(StringComparer.OrdinalIgnoreCase);
 
         private static ConcurrentDictionary<string, bool> _enabledCameras = new(StringComparer.OrdinalIgnoreCase);
 
@@ -121,6 +123,8 @@ namespace SynoAI.Controllers
                 Stopwatch overallStopwatch = Stopwatch.StartNew();
 
                 // Start loop for requesting snapshots until a valid prediction is found or MaxSnapshots is reached
+                bool detection = false;
+                int delay = camera.GetDelay();
                 for (int snapshotCount = 1; snapshotCount <= Config.MaxSnapshots; snapshotCount++)
                 {
                     // Take the snapshot from Surveillance Station
@@ -203,8 +207,9 @@ namespace SynoAI.Controllers
                                         zone.End = max;
                                         zone.Prediction = prediction;
                                         zone.Mode = OverlapMode.Contains;
+                                        zone.DetectedTicks = DateTime.UtcNow.Ticks;
 
-                                        _logger.LogDebug($"{id}: Adding temporary exclusion for '{prediction.Label}' ([{zone.Start.X},{zone.Start.Y}],[{zone.End.X},{zone.End.Y}]) at EVENT TIME {overallStopwatch.ElapsedMilliseconds}ms.");
+                                        _logger.LogDebug($"{id}: Adding temporary exclusion for '{prediction.Label}' at ([{zone.Start.X},{zone.Start.Y}],[{zone.End.X},{zone.End.Y}]) at EVENT TIME {overallStopwatch.ElapsedMilliseconds}ms.");
                                         created.Add(zone);
                                     }
                                 }
@@ -222,27 +227,37 @@ namespace SynoAI.Controllers
                     }
 
                     // add in new ones now so they don't trip on predictions from this measurement
-                    if (camera.Exclusions == null)
-                        camera.Exclusions = new();
-                    camera.Exclusions.AddRange(created);
+                    if (created.Count > 0)
+                    {
+                        if (camera.Exclusions == null)
+                            camera.Exclusions = new();
+                        camera.Exclusions.AddRange(created);
+                    }
 
                     // clean out unmatched temp exclusions
                     foreach (Zone exclusion in unmatched)
                     {
-                        // Clear any unmatched exclusion that was created from a prediction
+                        // Clear any unmatched exclusions that were created from a prediction
                         if (exclusion.Prediction != null)
                         {
-                            _logger.LogDebug($"{id}: Removing temporary exclusion zone ([{exclusion.Start.X},{exclusion.Start.Y}],[{exclusion.End.X},{exclusion.End.Y}]) as it did not match with any prediction");
+                            long delta = (DateTime.UtcNow.Ticks - exclusion.DetectedTicks) /TimeSpan.TicksPerMillisecond;
+                            _logger.LogDebug($"{id}: Removing temporary exclusion zone ([{exclusion.Start.X},{exclusion.Start.Y}],[{exclusion.End.X},{exclusion.End.Y}]) as it did not match with any prediction [{delta / 1000} second duration]");
                             camera.Exclusions.Remove(exclusion);
 
-                            // Send a notification if this was idle for more than 1 detection
-                            if (exclusion.Detections > 0)
-                                validPredictions.Add(exclusion.Prediction);
+                            // Send a notification if this was first detected more than a couple GetDelayAfterSuccess ago
+                            if (delta > (3*camera.GetDelayAfterSuccess()))
+                            {
+                                AIPrediction p = exclusion.Prediction;
+                                p.Label = "Missing " + p.Label;
+                                validPredictions.Add(p);
+                            }
                         }
                     }
 
                     if (validPredictions.Count > 0)
                     {
+                        detection = true;
+
                         // Process and save the snapshot
                         ProcessedImage processedImage = SnapshotManager.DressImage(camera, snapshot, predictions, validPredictions, _logger);
 
@@ -260,9 +275,8 @@ namespace SynoAI.Controllers
                         _logger.LogInformation($"{id}: Valid object found in snapshot {snapshotCount} of {Config.MaxSnapshots} at EVENT TIME {overallStopwatch.ElapsedMilliseconds}ms.");
 
                         // Extend the delay until the next motion detection will be run if a delay after success is specified
-                        int successDelay = camera.GetDelayAfterSuccess();
-                        AddCameraDelay(id, successDelay);
-                        return;
+                        delay = camera.GetDelayAfterSuccess();
+                        break;
                     }
                     else if (predictions.Any())
                     {
@@ -283,14 +297,23 @@ namespace SynoAI.Controllers
 
                         _logger.LogDebug(nothingFoundOutput.ToString());
                     }
-
                     _logger.LogInformation($"{id}: Finished ({overallStopwatch.ElapsedMilliseconds}ms).");
                 }
 
+                // Note there was an event
+                NoteCameraEvent(id);
 
                 // Add the delay (if any)
-                int delay = camera.GetDelay();
                 AddCameraDelay(id, delay);
+                if (detection)
+                {
+                    // in something was detected, check to see if we need to trigger a delayed GET in the future (post-delay) to re-evaluate any temporary exclusions
+                    bool pendingTempExclusions = camera.Exclusions == null ? false : camera.Exclusions.Any(z => z.Prediction != null);
+                    if (pendingTempExclusions)
+                    {
+                        ScheduleFutureGet(camera.Name, camera.GetDelayAfterSuccess() + 1000);
+                    }
+                }
             }
             finally
             {
@@ -302,12 +325,12 @@ namespace SynoAI.Controllers
                 }
             }
         }
-        
+
         [HttpPost]
         [Route("{id}")]
-        public void Post(string id, [FromBody]CameraOptionsDto options)
+        public void Post(string id, [FromBody] CameraOptionsDto options)
         {
-            if (options.HasChanged(x=> x.Enabled))
+            if (options.HasChanged(x => x.Enabled))
             {
                 _enabledCameras.AddOrUpdate(id, options.Enabled, (key, oldValue) => options.Enabled);
             }
@@ -340,20 +363,21 @@ namespace SynoAI.Controllers
                     if (exclude && exclusion.Prediction != null)
                     {
                         // if this is an exclusion of a prediction be more careful about matches
-                        int innerStartX = exclusion.Prediction.MinX + (exclusion.Prediction.MinX - exclusion.Start.X);
-                        int innerStartY = exclusion.Prediction.MinY + (exclusion.Prediction.MinY - exclusion.Start.Y);
-                        int innerEndX = exclusion.Prediction.MaxX - (exclusion.Prediction.MaxX - exclusion.End.X);
-                        int innerEndY = exclusion.Prediction.MaxY - (exclusion.Prediction.MaxY - exclusion.End.Y);
+                        int xdiff = (exclusion.Prediction.MinX - startX)*2;
+                        int ydiff = (exclusion.Prediction.MinY - startY)*2;
+                        int innerStartX = exclusion.Prediction.MinX + xdiff;
+                        int innerStartY = exclusion.Prediction.MinY + ydiff;
+                        int innerEndX = exclusion.Prediction.MaxX - xdiff;
+                        int innerEndY = exclusion.Prediction.MaxY - ydiff;
                         if (innerEndX > innerStartX && innerEndY > innerStartY)
                         {
-                            Rectangle inclusionZoneBoundary = new(innerStartX, innerStartY, innerEndX - innerStartX, innerEndX - innerEndY);
-                            exclude = !boundary.Contains(inclusionZoneBoundary);
+                            Rectangle inclusionZoneBoundary = new(innerStartX, innerStartY, innerEndX - innerStartX, innerEndY - innerStartY);
+                            exclude = boundary.Contains(inclusionZoneBoundary);
+                            _logger.LogDebug($"{id}: Testing if '{prediction.Label}' ([{prediction.MinX},{prediction.MinY}],[{prediction.MaxX},{prediction.MaxY}]) contains a smaller zone ([{inclusionZoneBoundary.Left},{inclusionZoneBoundary.Top}],[{inclusionZoneBoundary.Right},{inclusionZoneBoundary.Bottom}]) at EVENT TIME {overallStopwatch.ElapsedMilliseconds}ms. excluded=={exclude} ");
                         }
                     }
                     if (exclude)
                     {
-                        exclusion.Detections++;
-
                         // The prediction boundary is contained within or intersects an exclusion zone, so ignore it
                         _logger.LogDebug($"{id}: Ignored matching '{prediction.Label}' ([{prediction.MinX},{prediction.MinY}],[{prediction.MaxX},{prediction.MaxY}]) as it fell within the exclusion zone ([{exclusion.Start.X},{exclusion.Start.Y}],[{exclusion.End.X},{exclusion.End.Y}]) with exclusion mode '{exclusion.Mode}' at EVENT TIME {overallStopwatch.ElapsedMilliseconds}ms.");
                         ret = false;
@@ -364,6 +388,18 @@ namespace SynoAI.Controllers
                 }
             }
             return ret;
+        }
+
+        /// <summary>
+        /// Notes the most recent event on this camera
+        /// </summary>
+        /// <param name="id">The ID of the camera for this event.</param>
+        private void NoteCameraEvent(string id)
+        {
+            lock (_recentCameraChecks)
+            {
+                _recentCameraChecks.AddOrUpdate(id, DateTime.UtcNow, (key, oldValue) => DateTime.UtcNow);
+            }
         }
 
         /// <summary>
@@ -557,6 +593,30 @@ namespace SynoAI.Controllers
             }
 
             return predictions;
+        }
+
+        /// <summary>
+        /// Schedules a GET to trigger on this camera after a certain amount of time
+        /// </summary>
+        /// <param name="id">The name of the camera to trigger against.</param>
+        /// <param name="delay">Milliseconds to wait before firing the GET.</param>
+        private void ScheduleFutureGet(String id, int delay)
+        {
+            _logger.LogInformation($"{id}: Scheduling delayed GET in {delay}.");
+            Task t = Task.Delay(delay).ContinueWith(_ =>
+            {
+                if (_recentCameraChecks.TryGetValue(id, out DateTime recent) && DateTime.UtcNow > recent.AddMilliseconds(delay))
+                {
+                    _logger.LogInformation($"{id}: Running scheduled Get after {delay}.");
+                    Get(id);
+                }
+                else
+                {
+                    _logger.LogInformation($"{id}: Skipping scheduled Get after {delay}.");
+                }
+                _pendingGetRequests.Remove(id, out _);
+            });
+            _pendingGetRequests.AddOrUpdate(id, t, (key, oldValue) => t);
         }
     }
 }

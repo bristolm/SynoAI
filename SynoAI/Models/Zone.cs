@@ -6,6 +6,6 @@ namespace SynoAI.Models
         public Point End { get; set; }
         public OverlapMode Mode { get; set; }
         public AIPrediction Prediction { get; set; }
-        public int Detections { get; set; }
+        public long DetectedTicks { get; set; }
     }
 }
